@@ -1,0 +1,6 @@
+/external
+*.pt
+/chess_env
+*.pyc
+.env
+/runs
