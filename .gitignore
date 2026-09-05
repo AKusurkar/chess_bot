@@ -1,4 +1,4 @@
-/external
+/aichessathon-starter
 *.pt
 /chess_env
 *.pyc
