@@ -100,6 +100,7 @@ class Stage6Config:
     external_baselines_dir: str = "external/aichessathon-starter/baselines"
     seed: int = 0
     device: Optional[str] = None            # None = auto (cuda if available), or "cpu" / "cuda"
+    resume_from: Optional[str] = None       # checkpoint path to resume from; None = train from scratch
 
     # -- network -----------------------------------------------------------
     channels: int = 96
@@ -107,12 +108,12 @@ class Stage6Config:
 
     # -- outer loop --------------------------------------------------------
     num_epochs: int = 200
-    checkpoint_every: int = 5               # save march_hare_epoch_{n}.pt every N epochs
+    checkpoint_every: int = 1               # save march_hare_epoch_{n}.pt every N epochs
 
     # -- self-play (per epoch) --------------------------------------------
-    games_per_epoch: int = 64
-    games_in_flight: int = 32               # THE parallelism knob (batched leaf evals)
-    num_simulations: int = 64
+    games_per_epoch: int = 128
+    games_in_flight: int = 64               # THE parallelism knob (batched leaf evals)
+    num_simulations: int = 100
     c_puct: float = 2.0
     fpu: float = 0.0
     dirichlet_alpha: float = 0.3
@@ -135,7 +136,7 @@ class Stage6Config:
     use_amp: bool = False
 
     # -- evaluation --------------------------------------------------------
-    eval_every: int = 5
+    eval_every: int = 1
     eval_games: int = 20                    # vs the fixed reference checkpoint
     eval_num_simulations: int = 100         # inference-strength sims for eval play
     eval_opening_plies: int = 4             # random opening plies for diversity
@@ -176,6 +177,11 @@ class OuterLoop:
         net = MarchHare(channels=self.cfg.channels, num_blocks=self.cfg.num_blocks)
         self.trainer = Trainer(net, self._train_config())     # moves net onto device
         self.net = self.trainer.net
+
+        # Optionally resume: restore model + optimizer + LR schedule + step count.
+        if self.cfg.resume_from:
+            self.trainer.load_checkpoint(self.cfg.resume_from)
+            print(f"[stage6] resumed from {self.cfg.resume_from} (step {self.trainer._step})")
 
         self.buffer = ReplayBuffer(self.cfg.buffer_capacity)
         self.rng = np.random.default_rng(self.cfg.seed)
