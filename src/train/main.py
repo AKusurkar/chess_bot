@@ -101,6 +101,7 @@ class Stage6Config:
     seed: int = 0
     device: Optional[str] = None            # None = auto (cuda if available), or "cpu" / "cuda"
     resume_from: Optional[str] = None       # checkpoint path to resume from; None = train from scratch
+    resume_epoch = 0
 
     # -- network -----------------------------------------------------------
     channels: int = 96
@@ -111,8 +112,8 @@ class Stage6Config:
     checkpoint_every: int = 1               # save march_hare_epoch_{n}.pt every N epochs
 
     # -- self-play (per epoch) --------------------------------------------
-    games_per_epoch: int = 128
-    games_in_flight: int = 64               # THE parallelism knob (batched leaf evals)
+    games_per_epoch: int = 256
+    games_in_flight: int = 32               # THE parallelism knob (batched leaf evals)
     num_simulations: int = 100
     c_puct: float = 2.0
     fpu: float = 0.0
@@ -124,20 +125,20 @@ class Stage6Config:
 
     # -- replay buffer / training -----------------------------------------
     buffer_capacity: int = 500_000
-    min_buffer_to_train: int = 2_000        # don't train until there's real data
+    min_buffer_to_train: int = 10_000        # don't train until there's real data
     train_steps_per_epoch: int = 200
-    batch_size: int = 512
+    batch_size: int = 1024
     lr: float = 1e-3
     weight_decay: float = 1e-4
     optimizer: str = "adamw"
-    grad_clip_norm: Optional[float] = None
+    grad_clip_norm: Optional[float] = 1.0
     lr_step_size: Optional[int] = None
     lr_gamma: float = 0.1
     use_amp: bool = False
 
     # -- evaluation --------------------------------------------------------
-    eval_every: int = 1
-    eval_games: int = 20                    # vs the fixed reference checkpoint
+    eval_every: int = 3
+    eval_games: int = 14                    # vs the fixed reference checkpoint
     eval_num_simulations: int = 100         # inference-strength sims for eval play
     eval_opening_plies: int = 4             # random opening plies for diversity
     eval_move_time_ms: int = 120_000        # generous fixed budget (no wall clock in eval)
@@ -393,7 +394,7 @@ class OuterLoop:
 
     # -- checkpoints -------------------------------------------------------
     def _save_checkpoint(self, epoch: int) -> str:
-        path = os.path.join(self.cfg.checkpoint_dir, f"march_hare_epoch_{epoch}.pt")
+        path = os.path.join(self.cfg.checkpoint_dir, f"{self.cfg.run_name}_epoch_{epoch + self.cfg.resume_epoch}.pt")
         self.trainer.save_checkpoint(path)
         print(f"[stage6] saved checkpoint {path}")
         return path
