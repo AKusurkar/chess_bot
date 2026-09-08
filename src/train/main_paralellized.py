@@ -26,11 +26,16 @@ WHAT CHANGES vs main.py
 -----------------------
 Only OuterLoop._self_play_phase is overridden. Everything else — the buffer, the
 Trainer, the fixed-checkpoint eval curve, baselines, logging, checkpointing, the
-whole outer-loop structure — is INHERITED UNCHANGED from main.OuterLoop. The one
-behavioural difference is that the live per-game on_game stream is gone (workers
-return their results as a batch); the same degeneration signals (game-length
-mean/min/max, draw rate) are recomputed in the main process, so the logger and
-printout see identical numbers.
+whole outer-loop structure — is INHERITED UNCHANGED from main.OuterLoop.
+
+PROGRESS BAR
+------------
+The live per-game self-play tqdm bar IS preserved: each worker pushes a tick to a
+shared Manager queue as every game finishes (via generate_games_batched's on_game
+hook), and the main process drains that queue into a bar (total = games_per_epoch)
+while starmap_async runs. Same per-game bar main.py shows. The degeneration
+signals (game-length mean/min/max, draw rate) are recomputed from the returned
+GameResults, byte-for-byte what main.py logs.
 
 RUN
 ---
@@ -39,17 +44,26 @@ RUN
 Edit hyperparameters in main.Stage6Config exactly as before — this file reuses
 main.CONFIG. Tune NUM_WORKERS below for your machine.
 
+FILE-DESCRIPTOR / SHARING NOTE  (fixes OSError: [Errno 24] Too many open files)
+------------------------------------------------------------------------------
+Passing torch tensors through a Pool triggers torch's own tensor-sharing path,
+which under the default 'file_descriptor' strategy holds one OPEN FD per shared
+tensor. Broadcasting a full state_dict to every worker each epoch exhausts the FD
+limit and wedges the pool. Two defenses here:
+  1. ROOT FIX — the weight snapshot is converted to plain NUMPY before it crosses
+     the process boundary (ordinary pickle, copied into the pipe, no shared
+     memory, no FDs) and rebuilt into a tensor state_dict inside the worker.
+  2. Belt-and-suspenders — file_system sharing strategy + raising the FD soft
+     limit to the hard limit.
+
 GOTCHAS (all handled here)
 --------------------------
-  * spawn, not fork: CUDA contexts do not survive fork. The pool uses a spawn
-    context and the entrypoint sets the spawn start method under a __main__ guard.
+  * spawn, not fork: CUDA contexts do not survive fork. Pool + Manager use a spawn
+    context; the entrypoint sets the spawn start method under a __main__ guard.
   * torch.set_num_threads(1) per worker: otherwise each worker's torch tries to
     grab every core for its tiny forward passes and they fight over the cores we
     are trying to free.
-  * CPU weight snapshot: the state_dict is moved to CPU before crossing the
-    process boundary (~24MB per worker per epoch — trivial IPC).
-  * Distinct per-worker seeds via SeedSequence(cfg.seed, epoch).spawn(W): games
-    decorrelate across workers AND epochs, yet a fixed cfg.seed reproduces the run.
+  * Distinct per-worker seeds via SeedSequence(cfg.seed, epoch).spawn(W).
 """
 
 import os
@@ -60,6 +74,7 @@ from dotenv import load_dotenv
 load_dotenv()
 sys.path.append(os.getenv("PYTHONPATH"))
 
+import queue as _queue
 from collections import Counter
 from typing import Dict, Optional
 
@@ -80,10 +95,28 @@ from main import OuterLoop, CONFIG
 # =============================================================================
 # This box has 16 PHYSICAL cores (32 logical w/ hyperthreading). Self-play is
 # CPU-bound on the tree-walk, which scales with physical cores, not hyperthreads.
-# 12 workers leaves ~4 physical cores for the main process (training + eval run
-# there on the GPU) and the OS. Raise/lower and watch where wall-clock stops
-# improving — that plateau is the CPU (or the GPU) announcing the new bottleneck.
-NUM_WORKERS: int = 12
+# 8 workers is the SAFE start on a 10GB card: each worker opens its own CUDA
+# context (~0.5-1GB of GPU memory BEFORE any real work), so worker count is gated
+# by GPU context memory, not by your cores. Check nvidia-smi after the pool spawns
+# and raise toward 12 if there's headroom.
+NUM_WORKERS: int = 8
+
+
+# --------------------------------------------------------------------------- #
+# Process-wide FD / sharing hardening (call in main AND in each worker).
+# --------------------------------------------------------------------------- #
+def _harden_fd_limits() -> None:
+    """Avoid 'Too many open files' from torch multiprocessing tensor sharing."""
+    try:
+        mp.set_sharing_strategy("file_system")
+    except Exception:
+        pass
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))  # raise soft -> hard
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -91,34 +124,47 @@ NUM_WORKERS: int = 12
 # --------------------------------------------------------------------------- #
 # Each worker keeps ONE resident net on the GPU, built once at pool creation, so
 # CUDA init and the model object are paid for a single time and reused across all
-# epochs (not re-spawned every epoch).
+# epochs. _WORKER_Q is the shared progress queue used to drive the main-process bar.
 _WORKER_NET = None
+_WORKER_Q = None
 
 
-def _worker_init(channels: int, num_blocks: int, device: str) -> None:
+def _worker_init(channels: int, num_blocks: int, device: str, progress_q) -> None:
     """Runs once per worker when the pool is created."""
     import torch
 
+    _harden_fd_limits()
     torch.set_num_threads(1)        # don't let each worker grab all the cores
     torch.set_grad_enabled(False)   # workers are inference-only, forever
 
-    global _WORKER_NET
+    global _WORKER_NET, _WORKER_Q
+    _WORKER_Q = progress_q
     net = MarchHare(channels=channels, num_blocks=num_blocks).to(device)
     net.eval()
     _WORKER_NET = net
 
 
-def _worker_play(state_dict, num_games: int, games_in_flight: int,
-                 seed_seq, sp_kwargs: dict, max_forward_batch):
-    """Runs once per worker per epoch: load the fresh weights, then generate this
-    worker's slice of self-play games and return the GameResult list.
+def _tick(_result) -> None:
+    """on_game hook: one push per finished game -> one tick on the main bar."""
+    try:
+        if _WORKER_Q is not None:
+            _WORKER_Q.put(1)
+    except Exception:
+        pass
 
-    This is just a single-process batched self-play run — it reuses
-    generate_games_batched and the whole batched-MCTS stack UNCHANGED. Several of
-    these run at once; that concurrency is the entire speedup.
+
+def _worker_play(state_np, num_games: int, games_in_flight: int,
+                 seed_seq, sp_kwargs: dict, max_forward_batch):
+    """Runs once per worker per epoch: load the fresh weights (arriving as numpy,
+    rebuilt into a tensor state_dict here), then generate this worker's slice of
+    self-play games and return the GameResult list. Each finished game pushes a
+    tick to the shared progress queue.
     """
+    import torch
+
     global _WORKER_NET
-    _WORKER_NET.load_state_dict(state_dict)   # in-place copy onto the resident GPU net
+    state_dict = {k: torch.from_numpy(v) for k, v in state_np.items()}
+    _WORKER_NET.load_state_dict(state_dict)
     _WORKER_NET.eval()
 
     evaluate_batch = make_batched_net_evaluator(_WORKER_NET, max_batch=max_forward_batch)
@@ -127,7 +173,8 @@ def _worker_play(state_dict, num_games: int, games_in_flight: int,
     return generate_games_batched(
         evaluate_batch, num_games,
         games_in_flight=games_in_flight,
-        rng=rng, progress=False,              # no tqdm from workers (would clobber)
+        rng=rng, progress=False,              # no per-worker tqdm; main draws the bar
+        on_game=_tick,                        # per-game progress -> main bar
         **sp_kwargs,
     )
 
@@ -136,33 +183,37 @@ def _worker_play(state_dict, num_games: int, games_in_flight: int,
 # The parallel loop: inherit everything, override only self-play.
 # --------------------------------------------------------------------------- #
 class ParallelOuterLoop(OuterLoop):
-    """main.OuterLoop with the self-play phase fanned out across a worker pool.
-
-    Construct once, call .run(). The persistent pool is built in __init__ (CUDA
-    init is paid once) and torn down in run()'s finally.
-    """
+    """main.OuterLoop with the self-play phase fanned out across a worker pool."""
 
     def __init__(self, config=None):
+        _harden_fd_limits()
         super().__init__(config)              # builds trainer, buffer, eval, logging, ...
         self._sp_epoch = 0
 
-        ctx = mp.get_context("spawn")
+        self._ctx = mp.get_context("spawn")
+        # Manager queue: proxy-picklable, safe to hand to spawned workers, and used
+        # to stream per-game progress back for the self-play bar.
+        self._manager = self._ctx.Manager()
+        self._progress_q = self._manager.Queue()
+
         print(f"[parallel] spawning {NUM_WORKERS} self-play workers on {self.device} ...")
-        self._pool = ctx.Pool(
+        self._pool = self._ctx.Pool(
             processes=NUM_WORKERS,
             initializer=_worker_init,
-            initargs=(self.cfg.channels, self.cfg.num_blocks, str(self.device)),
+            initargs=(self.cfg.channels, self.cfg.num_blocks, str(self.device),
+                      self._progress_q),
         )
         print("[parallel] worker pool ready.")
 
     # -- the one overridden phase -----------------------------------------
     def _self_play_phase(self) -> Dict[str, float]:
-        # Parity with base: BN running stats (which live in the state_dict) are
-        # what the workers will use for inference.
-        self.net.eval()
+        from tqdm.auto import tqdm
 
-        # Fresh weights this epoch, on CPU for cheap cross-process transfer.
-        state_dict = {k: v.detach().cpu() for k, v in self.net.state_dict().items()}
+        # Parity with base: BN running stats (in the state_dict) drive worker
+        # inference. Weights cross the pipe as NUMPY (the FD-leak fix).
+        self.net.eval()
+        state_np = {k: v.detach().cpu().numpy()
+                    for k, v in self.net.state_dict().items()}
 
         # Split games_per_epoch evenly; drop empty chunks if games < workers.
         games = self.cfg.games_per_epoch
@@ -188,25 +239,38 @@ class ParallelOuterLoop(OuterLoop):
         # cfg.games_in_flight is now a PER-WORKER concurrency cap; total concurrency
         # across the pool is roughly len(chunks) x that. The GPU has the headroom.
         jobs = [
-            (state_dict, chunk, min(chunk, self.cfg.games_in_flight),
+            (state_np, chunk, min(chunk, self.cfg.games_in_flight),
              seed, sp_kwargs, self.cfg.max_forward_batch)
             for chunk, seed in zip(chunks, seeds)
         ]
 
-        print(f"[parallel] {games} games across {len(jobs)} workers "
-              f"(chunks={chunks}, in_flight/worker <= {self.cfg.games_in_flight})")
+        # Dispatch asynchronously, then drain the progress queue into the bar while
+        # the workers run. Bar total = total games this epoch (one tick per game).
+        async_res = self._pool.starmap_async(_worker_play, jobs)
+        bar = tqdm(total=games, desc="self-play", unit="game", leave=False)
 
-        # Blocks until every worker finishes — a clean barrier before training.
-        nested = self._pool.starmap(_worker_play, jobs)
+        def _drain() -> None:
+            try:
+                while True:
+                    self._progress_q.get_nowait()
+                    bar.update(1)
+            except _queue.Empty:
+                pass
+
+        while not async_res.ready():
+            _drain()
+            async_res.wait(timeout=0.2)       # brief block so we're not busy-spinning
+        _drain()                              # catch any final ticks
+        bar.close()
+
+        nested = async_res.get()              # ordered per-job results; re-raises worker errors
         results = [r for sub in nested for r in sub]
 
         # Funnel every worker's data into the single main-process buffer.
         for r in results:
             self.buffer.extend(r.examples)
 
-        # Recompute the SAME stats base derives from its live on_game stream, so
-        # the printout, the tensorboard log, and the degeneration signals are
-        # byte-for-byte the ones main.py would have produced.
+        # Recompute the SAME stats base derives from its live on_game stream.
         lengths = np.array([r.num_plies for r in results], dtype=np.float64)
         winners = Counter(r.winner for r in results)          # True=W, False=B, None=draw
         examples_added = int(sum(len(r.examples) for r in results))
@@ -237,6 +301,10 @@ class ParallelOuterLoop(OuterLoop):
             pool.close()
             pool.join()
             self._pool = None
+        manager = getattr(self, "_manager", None)
+        if manager is not None:
+            manager.shutdown()
+            self._manager = None
 
 
 def run_stage6_parallel(config=None) -> None:
@@ -245,6 +313,6 @@ def run_stage6_parallel(config=None) -> None:
 
 
 if __name__ == "__main__":
-    # CUDA + multiprocessing requires spawn; must be set under the __main__ guard.
     mp.set_start_method("spawn", force=True)
+    _harden_fd_limits()
     run_stage6_parallel(CONFIG)
